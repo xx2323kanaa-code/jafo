@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>FOOTSTEP-ALT DEBUG</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+
+<style>
+html,body{margin:0;padding:0;overflow:hidden;background:#000;color:#fff;font-family:sans-serif;}
+video{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;}
+
+#topBar{
+  position:fixed;top:0;left:0;right:0;
+  background:rgba(0,0,0,.8);padding:6px;text-align:center;
+}
+
+#panel{
+  position:fixed;bottom:0;left:0;right:0;
+  background:rgba(0,0,0,.85);padding:8px;
+}
+
+#hudBox{
+  display:none;
+  margin-top:6px;
+}
+
+textarea{
+  width:100%;
+  height:120px;
+  background:#111;
+  color:#0f0;
+  font-size:11px;
+}
+button{margin:2px;font-size:14px;}
+</style>
+</head>
+
+<body>
+
+<div id="topBar">
+  <b>FOOTSTEP-ALT</b> DEBUG MODE
+</div>
+
+<video id="video" playsinline muted></video>
+
+<div id="panel">
+  <button id="startBtn">▶ 開始</button>
+  <select id="cameraSel">
+    <option value="environment">背面</option>
+    <option value="user">前面</option>
+  </select>
+  <button id="hudBtn">HUD</button><br>
+
+  足：<span id="side">LEFT</span>　
+  左：<span id="leftCount">0</span>　
+  右：<span id="rightCount">0</span>
+
+  <!-- HUD 展開領域 -->
+  <div id="hudBox">
+    <textarea id="hudLog" readonly></textarea><br>
+    <button id="copyBtn">コピー</button>
+    <button id="logToggleBtn">ログ停止</button>
+  </div>
+</div>
+
+<script>
+/* ===== DOM ===== */
+const video = document.getElementById("video");
+const startBtn = document.getElementById("startBtn");
+const cameraSel = document.getElementById("cameraSel");
+const hudBtn = document.getElementById("hudBtn");
+const hudBox = document.getElementById("hudBox");
+const hudLog = document.getElementById("hudLog");
+const copyBtn = document.getElementById("copyBtn");
+const logToggleBtn = document.getElementById("logToggleBtn");
+
+const sideSpan = document.getElementById("side");
+const leftSpan = document.getElementById("leftCount");
+const rightSpan = document.getElementById("rightCount");
+
+/* ===== 状態 ===== */
+let model, stream=null;
+let intervalId=null;
+let running=false;
+
+let currentSide="LEFT";
+let leftCount=0, rightCount=0;
+let phase="BACK";
+
+let minSize=null, maxSize=null;
+
+/* ===== HUDログ ===== */
+let hudBuffer=[];
+const MAX_LOG=40;
+let logEnabled=true;
+
+/* ===== カメラ ===== */
+async function start(){
+  stream = await navigator.mediaDevices.getUserMedia({
+    video:{facingMode:cameraSel.value}
+  });
+  video.srcObject = stream;
+  await video.play();
+
+  model = await cocoSsd.load();
+  running=true;
+  startBtn.textContent="■ 停止";
+
+  intervalId = setInterval(detect, 800);
+}
+
+function stop(){
+  running=false;
+  if(intervalId){ clearInterval(intervalId); intervalId=null; }
+  if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
+  startBtn.textContent="▶ 開始";
+}
+
+/* ===== 検出 ===== */
+async function detect(){
+  if(!running) return;
+
+  const preds = await model.detect(video);
+  if(preds.length===0) return;
+
+  const target =
+    preds.find(p=>p.class==="person") ||
+    preds.slice().sort((a,b)=>(b.bbox[2]*b.bbox[3])-(a.bbox[2]*a.bbox[3]))[0];
+
+  const size = target.bbox[3]*0.33;
+
+  if(minSize===null){
+    minSize=size; maxSize=size;
+  }else{
+    minSize=Math.min(minSize,size);
+    maxSize=Math.max(maxSize,size);
+  }
+
+  const range = maxSize-minSize;
+
+  const line =
+    `size:${size.toFixed(1)} range:${range.toFixed(1)} phase:${phase} side:${currentSide}`;
+
+  if(logEnabled){
+    hudBuffer.push(line);
+    if(hudBuffer.length>MAX_LOG) hudBuffer.shift();
+    hudLog.value = hudBuffer.join("\n");
+  }
+
+  sideSpan.textContent=currentSide;
+  leftSpan.textContent=leftCount;
+  rightSpan.textContent=rightCount;
+}
+
+/* ===== UI ===== */
+startBtn.onclick=()=>{running?stop():start();};
+
+hudBtn.onclick=()=>{
+  hudBox.style.display = hudBox.style.display==="none" ? "block" : "none";
+};
+
+copyBtn.onclick=()=>{
+  navigator.clipboard.writeText(hudLog.value);
+};
+
+logToggleBtn.onclick=()=>{
+  logEnabled = !logEnabled;
+  logToggleBtn.textContent = logEnabled ? "ログ停止" : "ログ再開";
+};
+</script>
+
+</body>
+</html>
