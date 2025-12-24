@@ -1,52 +1,54 @@
 <!DOCTYPE html>
-<html lang="ja">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <title>Ankle Dorsi/Plantar Flexion Counter</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-
-<!-- TensorFlow + COCO -->
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.14.0"></script>
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 
 <style>
 body{
   margin:0;
   background:#fff;
   color:#000;
-  font-family:system-ui, sans-serif;
+  font-family:system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+}
+#header{
+  text-align:center;
+  padding:8px;
 }
 #title{
-  padding:6px;
-  font-weight:bold;
+  font-size:18px;
+  font-weight:600;
 }
-#countNow{
-  font-size:24px;
-  padding:6px;
+#count{
+  font-size:32px;
+  margin-top:4px;
 }
-#video{
-  width:100vw;
-  height:60vh;        /* ★ Android 安定 */
-  object-fit:cover;
+video{
+  width:100%;
+  height:auto;
   background:#000;
 }
-#panel{
-  position:fixed;
-  bottom:0; left:0; right:0;
-  background:#f0f0f0;
-  border-top:1px solid #999;
+#controls{
+  display:flex;
+  flex-wrap:wrap;
+  justify-content:center;
+  gap:6px;
+  padding:8px;
 }
-button, select{
-  margin:4px;
-  padding:6px;
+button{
+  font-size:14px;
 }
-#hud{
+#hudPanel{
   display:none;
-  font-size:12px;
-  max-height:160px;
-  overflow:auto;
-  white-space:pre;
-  border-top:1px dashed #999;
+  padding:8px;
+}
+#hudText{
+  white-space:pre-wrap;
+  font-size:11px;
+  max-height:220px;
+  overflow-y:auto;
+  border:1px solid #000;
   padding:4px;
 }
 </style>
@@ -54,173 +56,211 @@ button, select{
 
 <body>
 
-<div id="title">Ankle Dorsi/Plantar Flexion Counter</div>
-<div id="countNow">Now: 0</div>
-
-<video id="video" autoplay muted playsinline></video>
-
-<div id="panel">
-  <button id="startBtn">📷 Start Camera</button>
-  <select id="facing">
-    <option value="user">Front</option>
-    <option value="environment">Back</option>
-  </select>
-  <button id="hudBtn">HUD</button>
-  <button id="csvBtn">CSV</button>
-  <div id="hud"></div>
+<div id="header">
+  <div id="title">Ankle Dorsi/Plantar Flexion Counter</div>
+  <div id="count">Now: 0</div>
 </div>
 
+<video id="video" autoplay playsinline></video>
+
+<div id="controls">
+  <button id="startBtn">📷 Start Camera</button>
+  <button id="frontBtn">Front</button>
+  <button id="backBtn">Back</button>
+  <button id="hudBtn">HUD</button>
+  <button id="csvBtn">CSV</button>
+</div>
+
+<div id="hudPanel">
+  <pre id="hudText"></pre>
+  <button id="hudCopyBtn">📋 Copy HUD Log</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.16.0"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+
 <script>
-const video = document.getElementById("video");
-const countNow = document.getElementById("countNow");
-const hud = document.getElementById("hud");
-
+/* ======================
+   グローバル状態
+====================== */
+let video = document.getElementById("video");
 let model = null;
-let stream = null;
 let running = false;
+let facing = "environment";
 
-let lastFootY = null;
-let lastEventTime = 0;
-let lastSign = null;
-let armed = false;
+let lastY = null;
+let lastTime = null;
 
+let totalCountToday = 0;
 let sessionCount = 0;
-let todayCount = 0;
-let logs = [];
 
-const MAX_LOGS = 200;
+let motionTimes = []; // ★条件に合格した時刻（平均速度用）
 
-// ---- tuning (触ってOK) ----
-const THRESH_ON  = 6;
-const THRESH_OFF = 3;
-const LOCK_MS    = 800;
-const JUMP_CUT   = 120;
+let hudLines = [];
+let showHUD = false;
 
-// ---- daily storage ----
-const todayKey = new Date().toISOString().slice(0,10);
-let history = JSON.parse(localStorage.getItem("ankleHistory") || "{}");
-todayCount = history[todayKey] || 0;
+/* ======================
+   UI参照
+====================== */
+const countEl = document.getElementById("count");
+const hudPanel = document.getElementById("hudPanel");
+const hudText  = document.getElementById("hudText");
 
-// ---- camera ----
+/* ======================
+   カメラ制御
+====================== */
 async function startCamera(){
-  stream = await navigator.mediaDevices.getUserMedia({
-    video:{ facingMode: document.getElementById("facing").value }
+  if(running){
+    stopCamera();
+    return;
+  }
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video:{ facingMode:facing }
   });
   video.srcObject = stream;
 
-  // ★ 必ず ready を待つ
-  await new Promise(r => video.onloadedmetadata = r);
-  await video.play();
+  if(!model){
+    model = await cocoSsd.load();
+  }
+
+  running = true;
+  sessionCount = 0;
+  lastY = null;
+  lastTime = null;
+
+  detectLoop();
 }
 
 function stopCamera(){
-  if(stream){
-    stream.getTracks().forEach(t => t.stop());
-    stream = null;
+  running = false;
+  if(video.srcObject){
+    video.srcObject.getTracks().forEach(t=>t.stop());
+    video.srcObject = null;
   }
 }
 
-// ---- buttons ----
-document.getElementById("startBtn").onclick = async () => {
-  if(!running){
-    if(!model) model = await cocoSsd.load();
-    await startCamera();
-
-    running = true;
-    sessionCount = 0;
-    countNow.textContent = "Now: 0";
-    detectLoop();
-
-    document.getElementById("startBtn").textContent = "⏹ Stop";
-  }else{
-    running = false;
-    stopCamera();
-
-    todayCount += sessionCount;
-    history[todayKey] = todayCount;
-    localStorage.setItem("ankleHistory", JSON.stringify(history));
-
-    document.getElementById("startBtn").textContent = "📷 Start Camera";
-  }
-};
-
-document.getElementById("hudBtn").onclick = () => {
-  hud.style.display = hud.style.display === "none" ? "block" : "none";
-};
-
-document.getElementById("csvBtn").onclick = () => {
-  let csv = "date,count\n";
-  for(const d in history){
-    csv += `${d},${history[d]}\n`;
-  }
-  const blob = new Blob([csv], {type:"text/csv"});
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = "ankle_counts.csv";
-  a.click();
-};
-
-// ---- detection loop ----
+/* ======================
+   メイン検出ループ
+====================== */
 async function detectLoop(){
   if(!running) return;
 
-  // ★ HUD 生存ログ（最重要）
-  if(logs.length === 0){
-    logs.push("detectLoop running...");
-    hud.textContent = logs.join("\n");
-  }
-
+  const now = performance.now();
   const preds = await model.detect(video);
-  const p = preds.find(x => x.class === "person");
+  const person = preds.find(p=>p.class==="person");
 
-  if(p){
-    const footY = p.bbox[1]; // bbox TOP = 足先側
-    const now = performance.now();
+  if(person){
+    const bbox = person.bbox;
+    const topY = bbox[1];
+    const centerY = bbox[1] + bbox[3]/2;
+    const height = bbox[3];
 
-    if(lastFootY !== null){
-      const dY = footY - lastFootY;
+    if(lastY !== null && lastTime !== null){
+      const dY = centerY - lastY;
+      const dt = (now - lastTime)/1000;
 
-      if(Math.abs(dY) < JUMP_CUT){
-        const sign = dY > 0 ? "+" : dY < 0 ? "-" : "0";
-        let mark = "";
+      let sign = "0";
+      if(dY > 3) sign = "+";
+      else if(dY < -3) sign = "-";
 
-        if(!armed && Math.abs(dY) >= THRESH_ON && sign !== "0"){
-          armed = true;
-        }
+      let starred = false;
 
-        if(armed){
-          const timeOK = (now - lastEventTime) >= LOCK_MS;
-          const signOK = !lastSign || (sign !== lastSign && sign !== "0");
+      /* ★ 判定条件（B仕様） */
+      if(Math.abs(dY) >= 20 && dt >= 0.5 && dt <= 2.0){
+        sessionCount++;
+        totalCountToday++;
+        motionTimes.push(now);
 
-          if(timeOK && signOK && Math.abs(dY) >= THRESH_ON){
-            sessionCount++;
-            countNow.textContent = "Now: " + sessionCount;
-            lastEventTime = now;
-            lastSign = sign;
-            armed = false;
-            mark = " ★";
-          }
-
-          if(Math.abs(dY) <= THRESH_OFF){
-            armed = false;
-          }
-        }
-
-        const log =
-          `t:${((now-lastEventTime)/1000).toFixed(1)}s  ` +
-          `footY:${footY.toFixed(0)}  dY:${dY.toFixed(0)}  sign:${sign}${mark}`;
-
-        logs.push(log);
-        if(logs.length > MAX_LOGS) logs.shift();
-        hud.textContent = logs.join("\n");
+        starred = true;
+        countEl.textContent = "Now: " + totalCountToday;
       }
+
+      /* HUDログ（観測値完全保持） */
+      hudLines.push(
+        `t:${dt.toFixed(1)}s  topY:${Math.round(topY)}  centerY:${Math.round(centerY)}  height:${Math.round(height)}  dY:${Math.round(dY)}  sign:${sign}${starred?" ★":""}`
+      );
+
+      if(hudLines.length > 300) hudLines.shift();
+      if(showHUD) hudText.textContent = hudLines.join("\n");
     }
 
-    lastFootY = footY;
+    lastY = centerY;
+    lastTime = now;
   }
 
   requestAnimationFrame(detectLoop);
 }
+
+/* ======================
+   平均速度計算（B仕様）
+   ・★が3回以上
+   ・★間隔 0.5–2.0 秒のみ
+====================== */
+function calcAverageSpeed(){
+  if(motionTimes.length < 3) return "";
+
+  let validIntervals = [];
+  for(let i=1;i<motionTimes.length;i++){
+    const dt = (motionTimes[i]-motionTimes[i-1])/1000;
+    if(dt >= 0.5 && dt <= 2.0){
+      validIntervals.push(dt);
+    }
+  }
+  if(validIntervals.length < 2) return "";
+
+  const avg = validIntervals.reduce((a,b)=>a+b,0)/validIntervals.length;
+  return avg.toFixed(2);
+}
+
+/* ======================
+   CSV出力（B仕様）
+====================== */
+function exportCSV(){
+  const today = new Date();
+  const dateStr = today.toISOString().slice(0,10);
+  const avgSpeed = calcAverageSpeed();
+
+  const csv =
+`date,total_count,avg_interval_sec
+${dateStr},${totalCountToday},${avgSpeed}
+`;
+
+  const fname =
+    "AnkleCounter_" +
+    dateStr.replace(/-/g,"") +
+    ".csv";
+
+  const blob = new Blob([csv],{type:"text/csv"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = fname;
+  a.click();
+}
+
+/* ======================
+   UIイベント
+====================== */
+document.getElementById("startBtn").onclick = startCamera;
+
+document.getElementById("frontBtn").onclick = ()=>{
+  facing = "user";
+};
+
+document.getElementById("backBtn").onclick = ()=>{
+  facing = "environment";
+};
+
+document.getElementById("hudBtn").onclick = ()=>{
+  showHUD = !showHUD;
+  hudPanel.style.display = showHUD ? "block" : "none";
+  hudText.textContent = hudLines.join("\n");
+};
+
+document.getElementById("hudCopyBtn").onclick = ()=>{
+  navigator.clipboard.writeText(hudText.textContent);
+};
+
+document.getElementById("csvBtn").onclick = exportCSV;
 </script>
 
 </body>
