@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Ankle Dorsi/Plantar Flexion Counter</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.14.0"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+
+<style>
+body{
+  margin:0;
+  background:#fff;
+  color:#000;
+  font-family:system-ui, sans-serif;
+}
+#title{ padding:6px; font-weight:bold; }
+#countNow{ font-size:24px; padding:6px; }
+#video{
+  width:100vw;
+  height:60vh;
+  object-fit:cover;
+  background:#000;
+}
+#panel{
+  position:fixed;
+  bottom:0; left:0; right:0;
+  background:#f0f0f0;
+  border-top:1px solid #999;
+}
+button, select{
+  margin:4px;
+  padding:6px;
+}
+#hud{
+  display:none;
+  font-size:12px;
+  max-height:180px;
+  overflow:auto;
+  white-space:pre;
+  border-top:1px dashed #999;
+  padding:4px;
+}
+</style>
+</head>
+
+<body>
+
+<div id="title">Ankle Dorsi/Plantar Flexion Counter</div>
+<div id="countNow">Now: 0</div>
+
+<video id="video" autoplay muted playsinline></video>
+
+<div id="panel">
+  <button id="startBtn">📷 Start Camera</button>
+  <select id="facing">
+    <option value="user">Front</option>
+    <option value="environment">Back</option>
+  </select>
+  <button id="hudBtn">HUD</button>
+  <button id="csvBtn">CSV</button>
+  <div id="hud"></div>
+</div>
+
+<script>
+const video = document.getElementById("video");
+const countNow = document.getElementById("countNow");
+const hud = document.getElementById("hud");
+
+let model=null, stream=null, running=false;
+let lastFootY=null, lastEventTime=0, lastSign=null, armed=false;
+let sessionCount=0, logs=[];
+let starTimes=[]; // ★イベント時刻（performance.now）
+
+const MAX_LOGS=200;
+
+// ---- tuning ----
+const THRESH_ON=6;
+const THRESH_OFF=3;
+const LOCK_MS=800;
+const JUMP_CUT=120;
+
+// ---- daily storage ----
+const todayKey = new Date().toISOString().slice(0,10);
+let history = JSON.parse(localStorage.getItem("ankleHistory")||"{}");
+let todayCount = history[todayKey] || 0;
+
+// ---- camera ----
+async function startCamera(){
+  stream = await navigator.mediaDevices.getUserMedia({
+    video:{ facingMode: document.getElementById("facing").value }
+  });
+  video.srcObject = stream;
+  await new Promise(r => video.onloadedmetadata = r);
+  await video.play();
+}
+function stopCamera(){
+  if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
+}
+
+// ---- buttons ----
+document.getElementById("startBtn").onclick = async()=>{
+  if(!running){
+    if(!model) model = await cocoSsd.load();
+    await startCamera();
+    running=true;
+    sessionCount=0;
+    starTimes=[];
+    countNow.textContent="Now: 0";
+    detectLoop();
+    document.getElementById("startBtn").textContent="⏹ Stop";
+  }else{
+    running=false;
+    stopCamera();
+    todayCount += sessionCount;
+    history[todayKey]=todayCount;
+    localStorage.setItem("ankleHistory",JSON.stringify(history));
+    document.getElementById("startBtn").textContent="📷 Start Camera";
+  }
+};
+
+document.getElementById("hudBtn").onclick=()=>{
+  hud.style.display = hud.style.display==="none"?"block":"none";
+};
+
+// ---- 平均テンポ計算 ----
+function calculateAverageTempo(starTimes){
+  if(starTimes.length < 3) return null;
+
+  let intervals=[];
+  for(let i=1;i<starTimes.length;i++){
+    const dt=(starTimes[i]-starTimes[i-1])/1000;
+    intervals.push(dt);
+  }
+
+  // 有効区間をブロック化
+  let blocks=[], current=[];
+  for(const t of intervals){
+    if(t>=0.5 && t<=2.0){
+      current.push(t);
+    }else{
+      if(current.length>=2) blocks.push([...current]);
+      current=[];
+    }
+  }
+  if(current.length>=2) blocks.push([...current]);
+
+  if(blocks.length===0) return null;
+
+  // 全ブロックを平均
+  const all = blocks.flat();
+  const avgSec = all.reduce((a,b)=>a+b,0)/all.length;
+  const rpm = 60/avgSec;
+  return rpm.toFixed(1);
+}
+
+// ---- CSV ----
+document.getElementById("csvBtn").onclick=()=>{
+  // 今日の分を強制反映
+  history[todayKey]=(history[todayKey]||0)+sessionCount;
+  localStorage.setItem("ankleHistory",JSON.stringify(history));
+
+  const avgRPM = calculateAverageTempo(starTimes) || "";
+
+  let csv="date,count,avg_rpm\n";
+  for(const d in history){
+    csv+=`${d},${history[d]},${d===todayKey?avgRPM:""}\n`;
+  }
+
+  const dateStr=todayKey.replace(/-/g,"");
+  const filename=`AnkleDorsiPlantarCounter_${dateStr}.csv`;
+
+  const blob=new Blob([csv],{type:"text/csv"});
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download=filename;
+  a.click();
+};
+
+// ---- detection loop ----
+async function detectLoop(){
+  if(!running) return;
+
+  if(logs.length===0){
+    logs.push("detectLoop running...");
+    hud.textContent=logs.join("\n");
+  }
+
+  const preds = await model.detect(video);
+  const p = preds.find(x=>x.class==="person");
+
+  if(p){
+    const footY = p.bbox[1];
+    const now = performance.now();
+
+    if(lastFootY!==null){
+      const dY = footY-lastFootY;
+      if(Math.abs(dY)<JUMP_CUT){
+        const sign = dY>0?"+":dY<0?"-":"0";
+        let mark="";
+
+        if(!armed && Math.abs(dY)>=THRESH_ON && sign!=="0"){
+          armed=true;
+        }
+
+        if(armed){
+          const timeOK=(now-lastEventTime)>=LOCK_MS;
+          const signOK=!lastSign||(sign!==lastSign&&sign!=="0");
+          if(timeOK && signOK && Math.abs(dY)>=THRESH_ON){
+            sessionCount++;
+            countNow.textContent="Now: "+sessionCount;
+            lastEventTime=now;
+            lastSign=sign;
+            armed=false;
+            mark=" ★";
+            starTimes.push(now); // ★記録
+          }
+          if(Math.abs(dY)<=THRESH_OFF) armed=false;
+        }
+
+        const log=`t:${((now-lastEventTime)/1000).toFixed(1)}s  footY:${footY.toFixed(0)}  dY:${dY.toFixed(0)}  sign:${sign}${mark}`;
+        logs.push(log);
+        if(logs.length>MAX_LOGS) logs.shift();
+        hud.textContent=logs.join("\n");
+      }
+    }
+    lastFootY=footY;
+  }
+  requestAnimationFrame(detectLoop);
+}
+</script>
+
+</body>
+</html>
