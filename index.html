@@ -2,10 +2,10 @@
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
-<title>Ankle Dorsi/Plantar Flexion Counter (Human-Centered)</title>
+<title>Ankle Dorsi/Plantar Flexion Counter</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-<!-- COCO -->
+<!-- TensorFlow + COCO -->
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.14.0"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
 
@@ -16,11 +16,6 @@ body{
   color:#000;
   font-family:system-ui, sans-serif;
 }
-#video{
-  width:100vw;
-  height:70vh;
-  object-fit:cover;
-}
 #title{
   padding:6px;
   font-weight:bold;
@@ -28,6 +23,12 @@ body{
 #countNow{
   font-size:24px;
   padding:6px;
+}
+#video{
+  width:100vw;
+  height:60vh;        /* ★ Android 安定 */
+  object-fit:cover;
+  background:#000;
 }
 #panel{
   position:fixed;
@@ -42,7 +43,7 @@ button, select{
 #hud{
   display:none;
   font-size:12px;
-  max-height:150px;
+  max-height:160px;
   overflow:auto;
   white-space:pre;
   border-top:1px dashed #999;
@@ -74,123 +75,150 @@ const video = document.getElementById("video");
 const countNow = document.getElementById("countNow");
 const hud = document.getElementById("hud");
 
-let model;
-let stream=null;
-let running=false;
+let model = null;
+let stream = null;
+let running = false;
 
-let lastFootY=null;
-let lastEventTime=0;
-let lastSign=null;
-let armed=false;
+let lastFootY = null;
+let lastEventTime = 0;
+let lastSign = null;
+let armed = false;
 
-let sessionCount=0;
-let todayCount=0;
-let side="LEFT";
+let sessionCount = 0;
+let todayCount = 0;
+let logs = [];
 
-let logs=[];
-const MAX_LOGS=200;
+const MAX_LOGS = 200;
 
-// tuning
-const THRESH_ON=6;
-const THRESH_OFF=3;
-const LOCK_MS=800;
-const JUMP_CUT=120;
+// ---- tuning (触ってOK) ----
+const THRESH_ON  = 6;
+const THRESH_OFF = 3;
+const LOCK_MS    = 800;
+const JUMP_CUT   = 120;
 
-// load counts
+// ---- daily storage ----
 const todayKey = new Date().toISOString().slice(0,10);
-let history = JSON.parse(localStorage.getItem("ankleHistory")||"{}");
-todayCount = history[todayKey]||0;
+let history = JSON.parse(localStorage.getItem("ankleHistory") || "{}");
+todayCount = history[todayKey] || 0;
 
-// camera
+// ---- camera ----
 async function startCamera(){
   stream = await navigator.mediaDevices.getUserMedia({
-    video:{facingMode:document.getElementById("facing").value}
+    video:{ facingMode: document.getElementById("facing").value }
   });
-  video.srcObject=stream;
+  video.srcObject = stream;
+
+  // ★ 必ず ready を待つ
+  await new Promise(r => video.onloadedmetadata = r);
+  await video.play();
 }
 
 function stopCamera(){
   if(stream){
-    stream.getTracks().forEach(t=>t.stop());
-    stream=null;
+    stream.getTracks().forEach(t => t.stop());
+    stream = null;
   }
 }
 
-// buttons
-document.getElementById("startBtn").onclick=async()=>{
+// ---- buttons ----
+document.getElementById("startBtn").onclick = async () => {
   if(!running){
     if(!model) model = await cocoSsd.load();
     await startCamera();
-    running=true;
-    sessionCount=0;
-    countNow.textContent="Now: 0";
+
+    running = true;
+    sessionCount = 0;
+    countNow.textContent = "Now: 0";
     detectLoop();
-    document.getElementById("startBtn").textContent="⏹ Stop";
+
+    document.getElementById("startBtn").textContent = "⏹ Stop";
   }else{
-    running=false;
+    running = false;
     stopCamera();
-    todayCount+=sessionCount;
-    history[todayKey]=todayCount;
-    localStorage.setItem("ankleHistory",JSON.stringify(history));
-    document.getElementById("startBtn").textContent="📷 Start Camera";
+
+    todayCount += sessionCount;
+    history[todayKey] = todayCount;
+    localStorage.setItem("ankleHistory", JSON.stringify(history));
+
+    document.getElementById("startBtn").textContent = "📷 Start Camera";
   }
 };
 
-document.getElementById("hudBtn").onclick=()=>{
-  hud.style.display = hud.style.display==="none"?"block":"none";
+document.getElementById("hudBtn").onclick = () => {
+  hud.style.display = hud.style.display === "none" ? "block" : "none";
 };
 
-document.getElementById("csvBtn").onclick=()=>{
-  let csv="date,count\n";
-  for(let d in history){
-    csv+=`${d},${history[d]}\n`;
+document.getElementById("csvBtn").onclick = () => {
+  let csv = "date,count\n";
+  for(const d in history){
+    csv += `${d},${history[d]}\n`;
   }
-  const blob=new Blob([csv],{type:"text/csv"});
-  const a=document.createElement("a");
-  a.href=URL.createObjectURL(blob);
-  a.download="ankle_counts.csv";
+  const blob = new Blob([csv], {type:"text/csv"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "ankle_counts.csv";
   a.click();
 };
 
-// detection
+// ---- detection loop ----
 async function detectLoop(){
   if(!running) return;
+
+  // ★ HUD 生存ログ（最重要）
+  if(logs.length === 0){
+    logs.push("detectLoop running...");
+    hud.textContent = logs.join("\n");
+  }
+
   const preds = await model.detect(video);
-  const p = preds.find(x=>x.class==="person");
+  const p = preds.find(x => x.class === "person");
+
   if(p){
-    const footY = p.bbox[1]; // TOP = 足先側
+    const footY = p.bbox[1]; // bbox TOP = 足先側
     const now = performance.now();
-    if(lastFootY!==null){
-      const dY = footY-lastFootY;
-      if(Math.abs(dY)<JUMP_CUT){
-        const sign = dY>0?"+":dY<0?"-":"0";
-        let mark="";
-        if(!armed && Math.abs(dY)>=THRESH_ON && sign!=="0"){
-          armed=true;
+
+    if(lastFootY !== null){
+      const dY = footY - lastFootY;
+
+      if(Math.abs(dY) < JUMP_CUT){
+        const sign = dY > 0 ? "+" : dY < 0 ? "-" : "0";
+        let mark = "";
+
+        if(!armed && Math.abs(dY) >= THRESH_ON && sign !== "0"){
+          armed = true;
         }
+
         if(armed){
-          const timeOK = (now-lastEventTime)>=LOCK_MS;
-          const signOK = !lastSign || (sign!==lastSign && sign!=="0");
-          if(timeOK && signOK && Math.abs(dY)>=THRESH_ON){
+          const timeOK = (now - lastEventTime) >= LOCK_MS;
+          const signOK = !lastSign || (sign !== lastSign && sign !== "0");
+
+          if(timeOK && signOK && Math.abs(dY) >= THRESH_ON){
             sessionCount++;
-            countNow.textContent="Now: "+sessionCount;
-            lastEventTime=now;
-            lastSign=sign;
-            armed=false;
-            mark=" ★";
+            countNow.textContent = "Now: " + sessionCount;
+            lastEventTime = now;
+            lastSign = sign;
+            armed = false;
+            mark = " ★";
           }
-          if(Math.abs(dY)<=THRESH_OFF){
-            armed=false;
+
+          if(Math.abs(dY) <= THRESH_OFF){
+            armed = false;
           }
         }
-        const log=`t:${((now-lastEventTime)/1000).toFixed(1)}s footY:${footY.toFixed(0)} dY:${dY.toFixed(0)} sign:${sign}${mark}`;
+
+        const log =
+          `t:${((now-lastEventTime)/1000).toFixed(1)}s  ` +
+          `footY:${footY.toFixed(0)}  dY:${dY.toFixed(0)}  sign:${sign}${mark}`;
+
         logs.push(log);
-        if(logs.length>MAX_LOGS) logs.shift();
-        hud.textContent=logs.join("\n");
+        if(logs.length > MAX_LOGS) logs.shift();
+        hud.textContent = logs.join("\n");
       }
     }
-    lastFootY=footY;
+
+    lastFootY = footY;
   }
+
   requestAnimationFrame(detectLoop);
 }
 </script>
